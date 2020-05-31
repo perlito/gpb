@@ -1,0 +1,105 @@
+#!/usr/bin/env perl
+use Mojolicious::Lite;
+use Mojo::Pg;
+use YAML::Tiny;
+
+my $yaml = YAML::Tiny->read($ENV{GDB_CONFIG}) or die "Cant read config!";
+
+my $config = $yaml->[0];
+
+my $pg = Mojo::Pg->new($config->{pg}->{uri}) or die "Cant connect to DB";
+
+any '/' => sub {
+    my $c = shift;
+
+    my $page_size = 100;
+
+    my $email = $c->param('email');
+
+    if ( $email && $email !~ /^([a-z0-9\_\-]+\@[a-z0-9\-]+\.[a-z]{2,3})$/i ){
+        $email = undef;
+        $c->stash->{error} = 'Введен некоректный адрес';
+    }
+
+
+    if ( $email ){
+
+        # Тут есть неясности в заднии, указано что поиск должен быть по адресу получателя
+        # а в таблицу message попадает только сообщения отправителя, в лог остальные,
+        # поэтому просто предпалагаю что получателя, и поэтому поиск идет
+        # по таблице log только. Далее, по заднию указано вывести строку лога из обоих таблиц
+        # как вариант я просто соеденил эти строки
+
+        my $res = $pg->db->query(q{
+                            SELECT l.created,
+                                   coalesce(m.str, '') || ' ' || coalesce(l.str, '') as str
+                              FROM log l
+                              LEFT JOIN message m ON m.int_id = l.int_id
+                             WHERE l.address = $1 -- Тут = потому как ищем по хеш индексу
+                             ORDER BY l.int_id, l.created
+                             LIMIT $2
+                            },
+                            $email,
+                            $page_size + 1,
+                            )
+                            ->hashes;
+
+        if ( $res && $res->first ){
+            my $messages = $res->to_array;
+
+            if ( scalar(@$messages) > $page_size ){
+                pop @{ $messages };
+                $c->stash->{message} = "Количество найденных строк превышает указанный лимит";
+            }
+
+            $c->stash->{log_items} = $messages;
+        }
+        else {
+            $c->stash->{error} = "Сообщений по адресу: $email не найдено";
+        }
+
+    }
+
+    $c->render(template => 'index');
+};
+
+app->start;
+__DATA__
+
+@@ index.html.ep
+% layout 'default';
+% title 'gpb';
+<form action="/" method="POST">
+    <h1>Введите адрес</h1>
+    <input type="text" name="email" value="<%= param('email') %>" > <!-- Может лучше type=email ??? -->
+    <input type="submit" value="Найти" >
+</form>
+<% if ( stash('error') ) { %>
+    <p style="color:red">Ошибка: <%= stash('error') %></p>
+<% } %>
+
+<p style="color:blue"><%= stash('message') %></p>
+
+<% if ( stash('log_items') ) { %>
+    <table border="1">
+        <tr>
+            <td>timestamp</td>
+            <td>str</td>
+        </tr>
+        <tbody>
+        <% for my $item ( @{ stash('log_items') } ) { %>
+            <tr>
+                <td><%= $item->{created} %></td>
+                <td><%= $item->{str} %></td>
+            </tr>
+        <% } %>
+        </tbody>
+    </table>
+<% } %>
+
+@@ layouts/default.html.ep
+<!DOCTYPE html>
+<html>
+  <head><title><%= title %></title></head>
+  <body><%= content %></body>
+</html>
